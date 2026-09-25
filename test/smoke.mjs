@@ -1,6 +1,7 @@
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { runLifecycle } from "./lifecycle.mjs";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -15,9 +16,9 @@ process.env.PI_CODING_AGENT_DIR = tempAgentDir;
 
 try {
 	const loader = await import(pathToFileURL(join(piRoot, "dist/core/extensions/loader.js")));
-	const { Agent } = await import(
-		pathToFileURL(join(piRoot, "node_modules/@earendil-works/pi-agent-core/dist/index.js")),
-	);
+	const nestedAgentCore = join(piRoot, "node_modules/@earendil-works/pi-agent-core/dist/index.js");
+	const { Agent } = await import(pathToFileURL(existsSync(nestedAgentCore)
+		? nestedAgentCore : join(piRoot, "../pi-agent-core/dist/index.js")));
 
 	const context = (sessionId, calls, cwd, model) => ({
 		hasUI: false,
@@ -25,7 +26,7 @@ try {
 		model,
 		sessionManager: { getSessionId: () => sessionId },
 		ui: {
-			notify() {},
+			notify(text, level) { calls.notifications.push({ text, level }); },
 			setStatus(key, text) {
 				calls.statusChanges.push({ key, text });
 				if (text === undefined) calls.extensionStatus.delete(key);
@@ -50,7 +51,7 @@ try {
 	const loadRuntime = async (
 		sessionId,
 		cwd = projectRoot,
-		model = { provider: "openai-codex", id: "gpt-5.6-sol" },
+		model = { provider: "openai-codex", api: "openai-codex-responses", id: "gpt-5.6-sol" },
 	) => {
 		const result = await loader.discoverAndLoadExtensions([extensionPath], cwd, tempAgentDir);
 		if (result.errors.length > 0) throw new Error(JSON.stringify(result.errors));
@@ -59,6 +60,7 @@ try {
 			compactions: 0,
 			compactError: false,
 			messages: [],
+			notifications: [],
 			statusChanges: [],
 			extensionStatus: new Map(),
 		};
@@ -101,9 +103,39 @@ try {
 	});
 
 	const runtimeA = await loadRuntime("runtime-a");
-	if ([...runtimeA.extension.commands.keys()].join(",") !== "alu-agent") {
-		throw new Error("the sole command entry must be alu-agent");
+	assert.deepEqual([...runtimeA.extension.commands.keys()].sort(), ["alu-agent", "codex-fast"]);
+	const fast = runtimeA.extension.commands.get("codex-fast").handler;
+	const payload = { model: "gpt-5.6-sol", instructions: "keep", text: { verbosity: "low" }, reasoning: { effort: "high" } };
+	assert.equal(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload }), undefined);
+	await fast("on", runtimeA.ctx);
+	assert.equal(runtimeA.calls.extensionStatus.get("codex-fast"), "codex-fast");
+	assert.deepEqual(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload }), { ...payload, service_tier: "priority" });
+	assert.deepEqual(payload, { model: "gpt-5.6-sol", instructions: "keep", text: { verbosity: "low" }, reasoning: { effort: "high" } });
+	assert.deepEqual(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload: { ...payload, model: "gpt-future" } }), { ...payload, model: "gpt-future", service_tier: "priority" });
+	for (const model of [
+		{ provider: "openai", api: "openai-codex-responses", id: "gpt-5.6-sol" },
+		{ provider: "openai-codex", api: "openai-responses", id: "gpt-5.6-sol" },
+	]) {
+		runtimeA.ctx.model = model;
+		await emit(runtimeA.extension, "model_select", runtimeA.ctx, { model });
+		assert.equal(runtimeA.calls.extensionStatus.has("codex-fast"), false);
+		await fast("status", runtimeA.ctx);
+		assert.match(runtimeA.calls.notifications.at(-1).text, /开启；当前模型：不适用/);
+		assert.equal(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload }), undefined);
 	}
+	for (const id of ["gpt-5.4-mini", "gpt-5.3-codex-spark", "gpt-6-astra", "gpt-future"]) {
+		runtimeA.ctx.model = { provider: "openai-codex", api: "openai-codex-responses", id };
+		await emit(runtimeA.extension, "model_select", runtimeA.ctx, { model: runtimeA.ctx.model });
+		assert.equal(runtimeA.calls.extensionStatus.get("codex-fast"), "codex-fast");
+		assert.deepEqual(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload: { model: id } }), { model: id, service_tier: "priority" });
+	}
+	await fast("off", runtimeA.ctx);
+	assert.equal(runtimeA.calls.extensionStatus.has("codex-fast"), false);
+	assert.equal(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload: { model: "gpt-6-astra" } }), undefined);
+	await fast("on", runtimeA.ctx);
+	await emit(runtimeA.extension, "session_start", runtimeA.ctx);
+	assert.equal(runtimeA.calls.extensionStatus.has("codex-fast"), false);
+	assert.equal(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload: { model: "gpt-6-astra" } }), undefined);
 	const wrapper = Agent.prototype.createLoopConfig;
 	const agentA = new Agent({ sessionId: "runtime-a" });
 	const configA = agentA.createLoopConfig();
@@ -114,6 +146,8 @@ try {
 	if (runtimeB.calls.extensionStatus.has("alu-sol-tuner")) {
 		throw new Error("idle tuner occupied the extension status area");
 	}
+	assert.equal(runtimeB.calls.extensionStatus.has("codex-fast"), false);
+	assert.equal(await emit(runtimeB.extension, "before_provider_request", runtimeB.ctx, { payload }), undefined);
 	const agentB = new Agent({ sessionId: "runtime-b" });
 	const configB = agentB.createLoopConfig();
 	if (typeof configB.shouldStopAfterTurn !== "function") throw new Error("runtime B hook was not installed");
@@ -293,7 +327,7 @@ try {
 	await emit(replacementB.extension, "session_shutdown", replacementB.ctx, { reason: "shutdown" });
 
 	console.log(
-		"smoke ok: discipline injection/gating/snapshot, global-only guard defaults, Sol/Astra stop/compact/resume, native compaction, compact error/retry, dual-runtime routing, stale cleanup, reload idempotence",
+		"smoke ok: Codex Fast request tier/model switching/isolation/reset, discipline injection/gating/snapshot, global-only guard defaults, Sol/Astra stop/compact/resume, native compaction, compact error/retry, dual-runtime routing, stale cleanup, reload idempotence",
 	);
 	await runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, message });
 } finally {

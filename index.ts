@@ -11,6 +11,7 @@ import {
 
 const EXTENSION_ID = "alu-sol-tuner";
 const STATUS_KEY = EXTENSION_ID;
+const CODEX_FAST_STATUS_KEY = "codex-fast";
 const TARGET_MODEL_IDS = new Set(["gpt-5.6-sol", "gpt-6-astra"]);
 const DEFAULT_GUARD_THRESHOLD = 250_000;
 const PATCH_KEY = Symbol.for("pi.sol-mid-turn-guard.patch.v2");
@@ -237,6 +238,14 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 	let guardThreshold = DEFAULT_GUARD_THRESHOLD;
 	let guardEnabled = true;
 	let disabled = new Set<string>();
+	let codexFastEnabled = false;
+
+	const supportsCodexFast = (model: ExtensionContext["model"]) =>
+		model?.provider === "openai-codex" && model.api === "openai-codex-responses";
+
+	const updateCodexFastStatus = (ctx: ExtensionContext) => {
+		ctx.ui.setStatus(CODEX_FAST_STATUS_KEY, codexFastEnabled && supportsCodexFast(ctx.model) ? "codex-fast" : undefined);
+	};
 
 	const resetCycle = () => {
 		phase = "idle";
@@ -326,6 +335,8 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		latestContext = ctx;
+		codexFastEnabled = false;
+		updateCodexFastStatus(ctx);
 		// Pi 0.84 session_start covers startup, /reload and the new runtime from /new.
 		const config = readConfig(ctx.cwd);
 		guardThreshold = config.guardThreshold;
@@ -339,6 +350,17 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 		if (!patch.active || !registerController(ctx)) {
 			ctx.ui.notify(`阿露 Agent 调教已停用：${patch.reason ?? "无法注册会话保护"}`, "error");
 		}
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		updateCodexFastStatus(ctx);
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (!codexFastEnabled || !supportsCodexFast(ctx.model)) return;
+		const payload = event.payload;
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+		return { ...payload, service_tier: "priority" };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -402,6 +424,8 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		ctx.ui.setStatus(CODEX_FAST_STATUS_KEY, undefined);
+		codexFastEnabled = false;
 		setStatus(ctx, undefined);
 		unregisterController();
 		latestContext = undefined;
@@ -427,6 +451,21 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 		+ "/alu-agent threshold <tokens> — 修改当前阈值并保存全局默认，如 450k、1.05m\n"
 		+ "/alu-agent status|help — 查看状态或帮助\n"
 		+ "全局默认与纪律配置仅在启动、/reload、/new 时读取；其他已存在会话保持原值。";
+
+	pi.registerCommand("codex-fast", {
+		description: "切换当前会话 Codex Fast 请求档位，或查看状态",
+		handler: async (args, ctx) => {
+			const command = args.trim();
+			if (command === "on" || command === "off") {
+				codexFastEnabled = command === "on";
+				updateCodexFastStatus(ctx);
+			} else if (command !== "status") {
+				ctx.ui.notify("用法：/codex-fast on|off|status", "error");
+				return;
+			}
+			ctx.ui.notify(`Codex Fast 当前会话开关：${codexFastEnabled ? "开启" : "关闭"}；当前模型：${supportsCodexFast(ctx.model) ? "适用" : "不适用"}。开启时仅请求 Fast 档位，实际是否兑现取决于订阅服务。`, "info");
+		},
+	});
 
 	pi.registerCommand("alu-agent", {
 		description: "设置当前上下文保护、全局默认，或查看状态",

@@ -2,10 +2,11 @@
 
 包名：`pi-alu-agent-tuner`。仓库地址：`aruru-project/pi-alu-agent-tuner`。已有本地安装可保留原目录名，避免影响路径依赖。
 
-一个 Pi 扩展，提供两项能力：
+一个 Pi 扩展，提供三项能力：
 
 - 为所有模型注入工程纪律，并为 `*-sol` 模型追加 Sol 专项纪律；
-- 当 `gpt-5.6-sol` 或 `gpt-6-astra` 在工具回合后超过 token 阈值时，先停止、压缩上下文，再自动继续任务；仅匹配这两个准确模型 ID。
+- 当 `gpt-5.6-sol` 或 `gpt-6-astra` 在工具回合后超过 token 阈值时，先停止、压缩上下文，再自动继续任务；仅匹配这两个准确模型 ID；
+- 独立的 `/codex-fast` 当前会话开关，对 Codex 请求指定 Fast 服务档位。
 
 如果 Pi 已原生提供同类的回合后停止能力，插件会自动让位。
 
@@ -93,7 +94,17 @@ GitHub 仓库现名为 `aruru-project/pi-alu-agent-tuner`，旧名为 `pi-alu-so
 
 `/alu-agent` 无参数时显示状态。阈值支持正整数或十进制加 `k`/`m`（不区分大小写），换算后必须是正整数 tokens。仅在 Sol/Astra 指定模型的工具回合结束时触发保护；`off` 后已经开始的压缩续跑会完成，后续回合停止触发本插件保护。纪律注入和 Pi 自身的自动压缩不受此开关影响。
 
-`on/off` 不写全局；`default on/off` 只保存未来初始化的默认开关，当前会话开关保持原值。`threshold` 保存成功后立即更新当前阈值，其他已存在会话保持原阈值。写入保留全局配置的其他字段；格式错误或写入失败会明确报错，当前设置保持原值，请修复配置/权限后重试。
+### Codex Fast（独立命令）
+
+```text
+/codex-fast on       # 当前会话开启
+/codex-fast off      # 当前会话关闭
+/codex-fast status   # 查看当前开关及当前模型是否适用
+```
+
+默认关闭；每次启动新会话、`/reload`、`/new` 后重置为关闭。只存在当前会话内存，不写配置或会话历史，不影响 `/alu-agent`、thinking 或 text verbosity。开启时，仅当当前模型的 provider 为 `openai-codex` 且 api 为 `openai-codex-responses`，在实际请求中添加 `service_tier: "priority"`（Codex 订阅线路的 Fast 档位），不更改模型 ID；不按模型 ID 设置白名单，由上游决定模型是否接受该档位。若上游拒绝，请按 Pi 显示的请求错误处理；插件不会降级重试。该开关仅请求 Fast 档位，不保证订阅服务实际兑现；尚未使用真实订阅调用验证。状态栏仅在开关开启且当前模型适用时显示 `codex-fast`，切走清空，切回恢复。
+
+`/alu-agent` 的 `on/off` 不写全局；`default on/off` 只保存未来初始化的默认开关，当前会话开关保持原值。`threshold` 保存成功后立即更新当前阈值，其他已存在会话保持原阈值。写入保留全局配置的其他字段；格式错误或写入失败会明确报错，当前设置保持原值，请修复配置/权限后重试。
 
 例如全局为 off/450k，A、B 启动后，在 A 执行 `on`、`threshold 800k`：A 为 on/800k，B 为 off/450k，全局为 off/800k。A 或 B 执行 `/reload`、`/new` 后变为 off/800k。
 
@@ -111,7 +122,7 @@ npm run smoke
 PI_CODING_AGENT_ROOT=/path/to/node_modules/@earendil-works/pi-coding-agent npm run smoke
 ```
 
-测试覆盖统一命令入口与配置文件名、纪律注入与初始化快照、全局 guard 默认、A/B 会话隔离、命令保存及报错、无逐轮热加载、Sol/Astra 停止/压缩/续跑和重载安全。`test/smoke.mjs` 使用真实 Pi 扩展加载器及 Agent 回合钩子，事件上下文、压缩与续跑发送为测试替身。`test/lifecycle.mjs` 进一步使用真实 SDK 命令分发、`AgentSession.reload()` 和 `AgentSessionRuntime.newSession()`（Pi 0.84.2 内置命令使用的生命周期入口）验证重新初始化；UI 和模型查询为替身，不运行交互终端、不调用模型服务。所有配置均在临时目录，测试结束清理。请以普通用户运行，权限失败用例会实际将临时配置目录设为只读。
+测试覆盖独立 `/codex-fast` 命令、模拟请求档位及状态栏切换、重载/新会话开关复位、统一 `/alu-agent` 命令入口与配置文件名、纪律注入与初始化快照、全局 guard 默认、A/B 会话隔离、命令保存及报错、无逐轮热加载、Sol/Astra 停止/压缩/续跑和重载安全。`test/smoke.mjs` 使用真实 Pi 扩展加载器及 Agent 回合钩子，事件上下文、压缩与续跑发送为测试替身。`test/lifecycle.mjs` 进一步使用真实 SDK 命令分发、`AgentSession.reload()` 和 `AgentSessionRuntime.newSession()`（Pi 0.84.2 内置命令使用的生命周期入口）验证重新初始化；UI 和模型查询为替身，不运行交互终端、不调用模型服务。所有配置均在临时目录，测试结束清理。请以普通用户运行，权限失败用例会实际将临时配置目录设为只读。
 
 ## 移除
 

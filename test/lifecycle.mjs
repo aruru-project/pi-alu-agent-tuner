@@ -20,7 +20,7 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 	writeConfig({ guardEnabled: false, guardThreshold: 450000, disable: ["sol-discipline"], unrelated: { keep: "yes" } });
 	writeFileSync(join(cwd, ".pi/alu-agent.json"), JSON.stringify({ guardEnabled: true, guardThreshold: 10, disable: [] }));
 	const model = {
-		id: "gpt-5.6-sol", name: "test Sol", provider: "openai", api: "openai-responses",
+		id: "gpt-5.6-sol", name: "test Sol", provider: "openai-codex", api: "openai-codex-responses",
 		reasoning: false, input: ["text"], contextWindow: 2000000, maxTokens: 1000,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
@@ -40,17 +40,24 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 	const hosts = [];
 	const makeHost = async () => {
 		const notifications = [];
+		const fastStatuses = new Map();
 		const host = await createAgentSessionRuntime(factory, {
 			cwd, agentDir: tempAgentDir, sessionManager: SessionManager.inMemory(cwd),
 		});
 		hosts.push(host);
 		const bind = (session) => session.bindExtensions({
-			uiContext: { notify: (text, level) => notifications.push({ text, level }), setStatus() {} },
+			uiContext: {
+				notify: (text, level) => notifications.push({ text, level }),
+				setStatus: (key, text) => {
+					if (text === undefined) fastStatuses.delete(key);
+					else fastStatuses.set(key, text);
+				},
+			},
 			onError: (error) => { throw new Error(JSON.stringify(error)); },
 		});
 		host.setRebindSession(bind);
 		await bind(host.session);
-		return { host, notifications };
+		return { host, notifications, fastStatuses };
 	};
 	const command = async (runtime, text) => {
 		runtime.notifications.length = 0;
@@ -63,6 +70,12 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		assert.match(notices.at(-1).text, /启动、\/reload、\/new/);
 		assert.match(notices.at(-1).text, /^阿露 Agent 调教：/);
 	};
+	const fastCommand = async (runtime, text) => {
+		runtime.notifications.length = 0;
+		await runtime.host.session.prompt(`/codex-fast ${text}`);
+		return runtime.notifications.at(-1);
+	};
+	const fastPayload = (runtime) => runtime.host.session.extensionRunner.emitBeforeProviderRequest({ model: "gpt-5.6-sol", text: { verbosity: "low" } });
 	const shouldStop = (runtime, tokens) => runtime.host.session.agent.createLoopConfig()
 		.shouldStopAfterTurn(turn(message("gpt-5.6-sol", tokens)));
 	try {
@@ -71,6 +84,16 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		const b = await makeHost();
 		await status(a, false, "450,000");
 		await status(b, false, "450,000");
+		assert.equal(a.fastStatuses.has("codex-fast"), false);
+		assert.deepEqual(await fastPayload(a), { model: "gpt-5.6-sol", text: { verbosity: "low" } });
+		assert.match((await fastCommand(a, "status")).text, /关闭；当前模型：适用/);
+		assert.match((await fastCommand(a, "on")).text, /开启；当前模型：适用/);
+		assert.equal(a.fastStatuses.get("codex-fast"), "codex-fast");
+		assert.deepEqual(await fastPayload(a), { model: "gpt-5.6-sol", text: { verbosity: "low" }, service_tier: "priority" });
+		assert.deepEqual(await fastPayload(b), { model: "gpt-5.6-sol", text: { verbosity: "low" } });
+		assert.equal(b.fastStatuses.has("codex-fast"), false);
+		assert.equal((await fastCommand(a, "on extra")).level, "error");
+		assert.equal(a.fastStatuses.get("codex-fast"), "codex-fast");
 		assert.equal(await shouldStop(a, 900000), false);
 		// Saving defaults preserves the other configuration fields.
 		await command(a, "default off");
@@ -87,13 +110,18 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		// These are the actual methods called by Pi's /reload and /new UI commands.
 		await a.host.session.reload();
 		await status(a, false, "800,000");
+		assert.equal(a.fastStatuses.has("codex-fast"), false);
+		assert.deepEqual(await fastPayload(a), { model: "gpt-5.6-sol", text: { verbosity: "low" } });
 		const newPrompt = await a.host.session.extensionRunner.emitBeforeAgentStart("hello", undefined, "base prompt");
 		assert.match(newPrompt.systemPrompt, /## 全局工程底线/);
 		assert.match(newPrompt.systemPrompt, /## GPT-5.6 Sol 专项纪律/);
+		assert.match((await fastCommand(b, "on")).text, /开启；当前模型：适用/);
 		const oldB = b.host.session;
 		assert.equal((await b.host.newSession()).cancelled, false);
 		assert.notEqual(b.host.session, oldB);
 		await status(b, false, "800,000");
+		assert.equal(b.fastStatuses.has("codex-fast"), false);
+		assert.deepEqual(await fastPayload(b), { model: "gpt-5.6-sol", text: { verbosity: "low" } });
 		assert.equal(oldB.agent.createLoopConfig().shouldStopAfterTurn, undefined);
 
 		// default on saves for future initialization while current off stays off.
@@ -158,7 +186,7 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		assert.deepEqual(readConfig(), { guardEnabled: true });
 		await status(a, false, "450,000");
 		assert.match((await command(a, "help")).at(-1).text, /\/alu-agent default on\|off/);
-		console.log("lifecycle ok (real Pi SDK): /alu-agent, alu-agent.json global/project config, A/B isolation, command dispatch/default writes, exact token inputs, no per-turn hot load, /reload and /new reinitialize, save failures, field preservation");
+		console.log("lifecycle ok (real Pi SDK): /codex-fast request hook and /reload /new memory reset, /alu-agent, alu-agent.json global/project config, A/B isolation, command dispatch/default writes, exact token inputs, no per-turn hot load, /reload and /new reinitialize, save failures, field preservation");
 	} finally {
 		for (const host of hosts) await host.dispose();
 	}
