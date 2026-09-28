@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { runUsageChecks, usageAuth } from "./codex-usage.mjs";
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,6 +23,7 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 	const model = {
 		id: "gpt-5.6-sol", name: "test Sol", provider: "openai-codex", api: "openai-codex-responses",
 		reasoning: false, input: ["text"], contextWindow: 2000000, maxTokens: 1000,
+		baseUrl: "https://chatgpt.com/backend-api",
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	};
 	const factory = async (options) => {
@@ -33,7 +35,7 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		});
 		await resourceLoader.reload();
 		assert.deepEqual(resourceLoader.getExtensions().errors, []);
-		const modelRuntime = { getModel: () => model };
+		const modelRuntime = { getModel: () => model, getAuth: async () => ({ auth: usageAuth }) };
 		const result = await createAgentSession({ ...options, settingsManager, resourceLoader, modelRuntime, model, tools: [] });
 		return { ...result, services: { cwd: options.cwd, agentDir: tempAgentDir, settingsManager, resourceLoader, modelRuntime }, diagnostics: [] };
 	};
@@ -82,6 +84,7 @@ export async function runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, 
 		// User's A/B example: local switches and threshold writes affect only A.
 		const a = await makeHost();
 		const b = await makeHost();
+		await runUsageChecks({ runtime: a, model });
 		await status(a, false, "450,000");
 		await status(b, false, "450,000");
 		assert.equal(a.fastStatuses.has("codex-fast"), false);

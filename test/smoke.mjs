@@ -103,7 +103,7 @@ try {
 	});
 
 	const runtimeA = await loadRuntime("runtime-a");
-	assert.deepEqual([...runtimeA.extension.commands.keys()].sort(), ["alu-agent", "codex-fast"]);
+	assert.deepEqual([...runtimeA.extension.commands.keys()].sort(), ["alu-agent", "codex-fast", "codex-usage"]);
 	const fast = runtimeA.extension.commands.get("codex-fast").handler;
 	const payload = { model: "gpt-5.6-sol", instructions: "keep", text: { verbosity: "low" }, reasoning: { effort: "high" } };
 	assert.equal(await emit(runtimeA.extension, "before_provider_request", runtimeA.ctx, { payload }), undefined);

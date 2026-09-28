@@ -1,3 +1,4 @@
+import { registerCodexUsage } from "./codex-usage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Agent, type AgentLoopConfig, type ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
@@ -226,6 +227,7 @@ function installPatch(): { active: boolean; reason?: string } {
 }
 
 export default function aluSolTuner(pi: ExtensionAPI): void {
+	registerCodexUsage(pi);
 	const generation = Symbol("alu-sol-tuner-generation");
 	let phase: GuardPhase = "idle";
 	let latestContext: ExtensionContext | undefined;

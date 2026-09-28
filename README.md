@@ -104,6 +104,22 @@ GitHub 仓库现名为 `aruru-project/pi-alu-agent-tuner`，旧名为 `pi-alu-so
 
 默认关闭；每次启动新会话、`/reload`、`/new` 后重置为关闭。只存在当前会话内存，不写配置或会话历史，不影响 `/alu-agent`、thinking 或 text verbosity。开启时，仅当当前模型的 provider 为 `openai-codex` 且 api 为 `openai-codex-responses`，在实际请求中添加 `service_tier: "priority"`（Codex 订阅线路的 Fast 档位），不更改模型 ID；不按模型 ID 设置白名单，由上游决定模型是否接受该档位。若上游拒绝，请按 Pi 显示的请求错误处理；插件不会降级重试。该开关仅请求 Fast 档位，不保证订阅服务实际兑现；尚未使用真实订阅调用验证。状态栏仅在开关开启且当前模型适用时显示 `codex-fast`，切走清空，切回恢复。
 
+### Codex 订阅额度（独立命令）
+
+```text
+/codex-usage          # 查询 Pi 登录账号的剩余额度及重置时间
+```
+
+使用 Pi 的 `modelRegistry.getApiKeyAndHeaders()` 取得运行时认证（由 Pi 管理凭据及刷新），向 `https://chatgpt.com/backend-api/wham/usage` 发起一次旁路 GET。当前使用 Codex 时遵循当前模型的认证；切到其他 provider 时使用已配置的官方 `openai-codex` 模型查询。只接受官方 ChatGPT 地址及 Codex 订阅凭据，不去读取 Codex CLI 或其他账号文件，不发送凭据到第三方地址，也不跟随重定向。
+
+显示账号级额度，而非当前会话 token 统计：按服务端返回的窗口时长标注 5 小时、周或其他窗口，剩余比例为 `100 - used_percent`；显示重置时间（运行 Pi 的机器本地时区）、额外模型额度、代码审查额度和 Credits（仅在返回时）。缺失数据不会当成 100% 剩余。手动查询，无轮询、持久缓存或配置写入；结果通过 UI 通知显示，不发模型请求、不写入模型对话历史。HTTP 请求及读取最多等待 15 秒，响应读取最多 64 KiB；失败显示明确提示，不输出凭据或上游原始错误正文。
+
+这是 ChatGPT 私有接口，不承诺长期稳定。服务不可用时可到 <https://chatgpt.com/codex/settings/usage> 查看。自动测试通过真实 Pi 扩展命令入口、合成凭据和 HTTP 测试替身验证。2026-09-28，用户在 Dock 中 `/reload` 后实际运行 `/codex-usage`，确认真实额度查询成功。
+
+接口与字段参考（未引入第三方插件依赖）：
+- [pi-usage：Pi 认证与额度接口](https://github.com/janvitos/pi-usage/blob/83d2daede4398a9748a48af1a2ccece4cdd6acdb/src/query.ts#L19-L43)
+- [pi-codex-status：Bearer、账号请求头及额度查询](https://github.com/lhl/pi-codex-status/blob/bc2643e01a13c8c7a849de5f6c572da4cfd2a5c9/src/usage.ts#L165-L196)
+
 `/alu-agent` 的 `on/off` 不写全局；`default on/off` 只保存未来初始化的默认开关，当前会话开关保持原值。`threshold` 保存成功后立即更新当前阈值，其他已存在会话保持原阈值。写入保留全局配置的其他字段；格式错误或写入失败会明确报错，当前设置保持原值，请修复配置/权限后重试。
 
 例如全局为 off/450k，A、B 启动后，在 A 执行 `on`、`threshold 800k`：A 为 on/800k，B 为 off/450k，全局为 off/800k。A 或 B 执行 `/reload`、`/new` 后变为 off/800k。
