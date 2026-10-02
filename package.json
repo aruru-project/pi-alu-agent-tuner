@@ -14,7 +14,8 @@
     "pi-package"
   ],
   "scripts": {
-    "smoke": "node test/smoke.mjs"
+    "smoke": "node test/smoke.mjs",
+    "guard": "node test/smoke.mjs --guard-only"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

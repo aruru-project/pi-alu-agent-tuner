@@ -1,7 +1,7 @@
 import { registerCodexUsage } from "./codex-usage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Agent, type AgentLoopConfig, type ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentLoopConfig, type AgentTurnContext, type AgentTurnDecision } from "@earendil-works/pi-agent-core";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
@@ -15,8 +15,8 @@ const STATUS_KEY = EXTENSION_ID;
 const CODEX_FAST_STATUS_KEY = "codex-fast";
 const TARGET_MODEL_IDS = new Set(["gpt-5.6-sol", "gpt-6-astra"]);
 const DEFAULT_GUARD_THRESHOLD = 250_000;
-const PATCH_KEY = Symbol.for("pi.sol-mid-turn-guard.patch.v2");
-const LEGACY_PATCH_KEY = Symbol.for("pi.sol-mid-turn-guard.patch.v1");
+const PATCH_KEY = Symbol.for("pi.sol-mid-turn-guard.patch.v3");
+const PREVIOUS_PATCH_KEYS = [Symbol.for("pi.sol-mid-turn-guard.patch.v2"), Symbol.for("pi.sol-mid-turn-guard.patch.v1")];
 const MARKER = "GPT-5.6 Sol";
 
 const FLOOR = `
@@ -53,14 +53,13 @@ const COMPACTION_FAILED_CONTINUATION =
 
 type GuardPhase = "idle" | "stopped" | "compacting";
 
-type AgentInternals = Agent & {
-	createLoopConfig(options?: { skipInitialSteeringPoll?: boolean }): AgentLoopConfig;
+type AgentInternals = {
+	createLoopConfig(this: Agent, options?: { skipInitialSteeringPoll?: boolean }): AgentLoopConfig;
 };
 
 interface GuardController {
 	readonly generation: symbol;
-	shouldStop(agent: Agent, turn: ShouldStopAfterTurnContext): Promise<boolean>;
-	onNativeHookDetected(): void;
+	shouldStop(agent: Agent, turn: AgentTurnContext): Promise<boolean>;
 	reportShimError(error: unknown): void;
 }
 
@@ -74,6 +73,7 @@ interface LegacyPatchHost {
 	readonly original: AgentInternals["createLoopConfig"];
 	readonly wrapper: AgentInternals["createLoopConfig"];
 	controller?: GuardController;
+	controllers?: Map<string, GuardController>;
 }
 
 interface AluSolConfig {
@@ -150,15 +150,11 @@ function getPatchHost(): PatchHost | undefined {
 	return (globalThis as Record<PropertyKey, unknown>)[PATCH_KEY] as PatchHost | undefined;
 }
 
-function getLegacyPatchHost(): LegacyPatchHost | undefined {
-	return (globalThis as Record<PropertyKey, unknown>)[LEGACY_PATCH_KEY] as LegacyPatchHost | undefined;
-}
-
 function setPatchHost(host: PatchHost): void {
 	(globalThis as Record<PropertyKey, unknown>)[PATCH_KEY] = host;
 }
 
-function usageTokens(turn: ShouldStopAfterTurnContext): number {
+function usageTokens(turn: AgentTurnContext): number {
 	const usage = turn.message.usage;
 	if (!usage) return 0;
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
@@ -174,40 +170,48 @@ function installPatch(): { active: boolean; reason?: string } {
 
 	if (!host) {
 		const descriptor = Object.getOwnPropertyDescriptor(prototype, "createLoopConfig");
-		const legacy = getLegacyPatchHost();
-		const legacyIsInstalled = legacy && descriptor?.value === legacy.wrapper;
+		const legacy = PREVIOUS_PATCH_KEYS
+			.map((key) => (globalThis as Record<PropertyKey, unknown>)[key] as LegacyPatchHost | undefined)
+			.find((previous) => previous && descriptor?.value === previous.wrapper);
+		const legacyIsInstalled = !!legacy;
 		const original = (legacyIsInstalled ? legacy.original : descriptor?.value) as
 			| AgentInternals["createLoopConfig"]
 			| undefined;
 		if (typeof original !== "function") {
 			return { active: false, reason: "当前 Pi 版本不支持此保护；请更新插件或 Pi" };
 		}
-		if (legacyIsInstalled) legacy.controller = undefined;
+		// Probe only the config shape. No run is started and provider I/O is forbidden.
+		const probe = new Agent({ streamFn: () => { throw new Error("保护兼容检查不能发起模型请求"); } });
+		if (!("finishTurn" in original.call(probe))) {
+			return { active: false, reason: "当前 Pi 版本不支持此保护；请使用 Pi 0.99.2 或更新插件" };
+		}
+		if (legacy) {
+			legacy.controller = undefined;
+			legacy.controllers?.clear();
+		}
 
 		host = {
 			original,
 			controllers: new Map(),
-			wrapper: function (this: AgentInternals, options) {
+			wrapper: function (this: Agent, options) {
 				const config = original.call(this, options);
 				const sessionId = config.sessionId;
 				const current = sessionId ? host?.controllers.get(sessionId) : undefined;
 				if (!current) return config;
 
-				if (typeof config.shouldStopAfterTurn === "function") {
-					current.onNativeHookDetected();
-					return config;
-				}
-
 				return {
 					...config,
-					shouldStopAfterTurn: async (turn) => {
+					finishTurn: async (turn: AgentTurnContext, signal?: AbortSignal): Promise<AgentTurnDecision | undefined> => {
+						// Pi's hook dispatches turn_end boundaries; its presence is not a guard.
+						const decision = (await config.finishTurn?.(turn, signal)) || undefined;
+						if (decision?.action === "end" || signal?.aborted) return decision;
 						const live = sessionId ? host?.controllers.get(sessionId) : undefined;
-						if (!live) return false;
+						if (!live) return decision;
 						try {
-							return await live.shouldStop(this, turn);
+							return await live.shouldStop(this, turn) ? { action: "end" } : decision;
 						} catch (error) {
 							live.reportShimError(error);
-							return false;
+							return decision;
 						}
 					},
 				};
@@ -233,7 +237,8 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 	let latestContext: ExtensionContext | undefined;
 	let stoppedTokens = 0;
 	let nativeCompacted = false;
-	let nativeHookDetected = false;
+	let guardUnavailable: string | undefined;
+	let cycle = Symbol("guard-cycle");
 	let continuationCount = 0;
 	let lastError: string | undefined;
 	let activeSessionId: string | undefined;
@@ -251,6 +256,7 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 
 	const resetCycle = () => {
 		phase = "idle";
+		cycle = Symbol("guard-cycle");
 		stoppedTokens = 0;
 		nativeCompacted = false;
 	};
@@ -266,7 +272,7 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 	const controller: GuardController = {
 		generation,
 		async shouldStop(agent, turn) {
-			if (!guardEnabled || phase !== "idle" || nativeHookDetected) return false;
+			if (!guardEnabled || phase !== "idle" || guardUnavailable) return false;
 			if (!TARGET_MODEL_IDS.has(turn.message.model)) return false;
 			if (turn.message.stopReason !== "toolUse" || turn.toolResults.length === 0) return false;
 
@@ -281,15 +287,9 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 			notify(`阿露 Agent 调教在 ${formatTokens(tokens)} tokens 暂停；空闲后压缩上下文`, "warning");
 			return true;
 		},
-		onNativeHookDetected() {
-			if (nativeHookDetected) return;
-			nativeHookDetected = true;
-			resetCycle();
-			if (latestContext) setStatus(latestContext, undefined);
-			notify("阿露 Agent 调教已让位：Pi 已提供回合后停止能力", "info");
-		},
 		reportShimError(error) {
 			lastError = error instanceof Error ? error.message : String(error);
+			guardUnavailable = "保护执行失败；请修复错误后 /reload";
 			resetCycle();
 			if (latestContext) setStatus(latestContext, undefined);
 			notify(`阿露 Agent 调教出错：${lastError}`, "error");
@@ -300,7 +300,10 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 
 	const registerController = (ctx: ExtensionContext): boolean => {
 		const host = getPatchHost();
-		if (!host) return false;
+		if (!host || (Agent.prototype as unknown as AgentInternals).createLoopConfig !== host.wrapper) {
+			guardUnavailable = "检测到其他上下文保护；请避免同时加载同类插件后 /reload";
+			return false;
+		}
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (activeSessionId && activeSessionId !== sessionId && host.controllers.get(activeSessionId) === controller) {
 			host.controllers.delete(activeSessionId);
@@ -339,18 +342,18 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 		latestContext = ctx;
 		codexFastEnabled = false;
 		updateCodexFastStatus(ctx);
-		// Pi 0.84 session_start covers startup, /reload and the new runtime from /new.
+		// session_start covers startup, /reload and the new runtime from /new.
 		const config = readConfig(ctx.cwd);
 		guardThreshold = config.guardThreshold;
 		guardEnabled = config.guardEnabled;
 		disabled = config.disabled;
-		nativeHookDetected = false;
+		guardUnavailable = patch.active ? undefined : patch.reason;
 		continuationCount = 0;
 		resetCycle();
 		lastError = undefined;
 		setStatus(ctx, undefined);
 		if (!patch.active || !registerController(ctx)) {
-			ctx.ui.notify(`阿露 Agent 调教已停用：${patch.reason ?? "无法注册会话保护"}`, "error");
+			ctx.ui.notify(`阿露 Agent 调教已停用：${guardUnavailable ?? "无法注册会话保护"}`, "error");
 		}
 	});
 
@@ -403,21 +406,25 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 		latestContext = ctx;
 		if (!patch.active || phase !== "stopped") return;
 
+		if (ctx.hasPendingMessages()) {
+			resetCycle();
+			return;
+		}
 		if (nativeCompacted) {
 			continueAgentLoop(ctx, COMPACTION_COMPLETED_CONTINUATION);
 			return;
 		}
-
 		phase = "compacting";
+		const compactCycle = cycle;
 		setStatus(ctx, `阿露 Agent 调教 · 正在压缩 ${formatTokens(stoppedTokens)}`);
 		// Use Pi's normal compaction preparation, summarizer, and session rebuild path.
 		ctx.compact({
 			onComplete: () => {
-				if (phase !== "compacting") return;
+				if (phase !== "compacting" || cycle !== compactCycle) return;
 				continueAgentLoop(ctx, COMPACTION_COMPLETED_CONTINUATION);
 			},
 			onError: (error) => {
-				if (phase !== "compacting") return;
+				if (phase !== "compacting" || cycle !== compactCycle) return;
 				lastError = error.message;
 				ctx.ui.notify(`阿露 Agent 调教压缩失败，已继续任务 — ${error.message}`, "error");
 				continueAgentLoop(ctx, COMPACTION_FAILED_CONTINUATION);
@@ -440,12 +447,12 @@ export default function aluSolTuner(pi: ExtensionAPI): void {
 			stopped: "等待压缩",
 			compacting: "正在压缩",
 		};
-		const availability = !patch.active
-			? `保护不可用：${patch.reason}`
-			: nativeHookDetected ? "Pi 已提供原生保护，本插件已让位" : phaseText[phase];
-		const status = `阿露 Agent 调教：当前会话保护=${guardEnabled ? "开启" : "关闭"}，当前阈值=${formatTokens(guardThreshold)} tokens；${availability}；已续跑=${continuationCount}`
+		if (patch.active) registerController(ctx);
+		const availability = guardUnavailable ? `保护不可用：${guardUnavailable}` : phaseText[phase];
+		const switchText = guardUnavailable ? "不可用" : guardEnabled ? "开启" : "关闭";
+		const status = `阿露 Agent 调教：当前会话保护=${switchText}，当前阈值=${formatTokens(guardThreshold)} tokens；${availability}；已续跑=${continuationCount}`
 			+ "\n全局默认在启动、/reload、/new 时读取；on/off 仅改当前会话，threshold 同时保存全局默认。";
-		ctx.ui.notify(lastError ? `${status}\n最近错误：${lastError}` : status, patch.active ? "info" : "error");
+		ctx.ui.notify(lastError ? `${status}\n最近错误：${lastError}` : status, guardUnavailable ? "error" : "info");
 	};
 
 	const help = "/alu-agent on|off — 仅切换当前会话保护\n"

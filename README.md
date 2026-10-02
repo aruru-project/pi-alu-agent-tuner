@@ -8,7 +8,7 @@
 - 当 `gpt-5.6-sol` 或 `gpt-6-astra` 在工具回合后超过 token 阈值时，先停止、压缩上下文，再自动继续任务；仅匹配这两个准确模型 ID；
 - 独立的 `/codex-fast` 当前会话开关，对 Codex 请求指定 Fast 服务档位。
 
-如果 Pi 已原生提供同类的回合后停止能力，插件会自动让位。
+上下文保护适配 Pi 0.99.2 的 `finishTurn` 协议：保留 Pi 的回合结束处理，超阈值时返回停止决定，空闲后走正常压缩与续跑。已有 `finishTurn` 本身不代表 Pi 已提供同类保护。旧协议或保护冲突/执行失败时，`/alu-agent status` 显示“不可用”，而不是“开启”；修复后执行 `/reload`。
 
 ## 配置
 
@@ -110,9 +110,11 @@ GitHub 仓库现名为 `aruru-project/pi-alu-agent-tuner`，旧名为 `pi-alu-so
 /codex-usage          # 查询 Pi 登录账号的剩余额度及重置时间
 ```
 
-使用 Pi 的 `modelRegistry.getApiKeyAndHeaders()` 取得运行时认证（由 Pi 管理凭据及刷新），向 `https://chatgpt.com/backend-api/wham/usage` 发起一次旁路 GET。当前使用 Codex 时遵循当前模型的认证；切到其他 provider 时使用已配置的官方 `openai-codex` 模型查询。只接受官方 ChatGPT 地址及 Codex 订阅凭据，不去读取 Codex CLI 或其他账号文件，不发送凭据到第三方地址，也不跟随重定向。
+使用 Pi 公开的 `ctx.modelRegistry.getApiKeyAndHeaders()` 取得运行时认证（Pi 0.99.2 仍提供此兼容入口，内部通过 `ModelRuntime.getAuth()` 解析；由 Pi 管理凭据及刷新），向 `https://chatgpt.com/backend-api/wham/usage` 发起一次旁路 GET。当前使用 Codex 时遵循当前模型的认证；切到其他 provider 时使用已配置的官方 `openai-codex` 模型查询。只接受官方 ChatGPT 地址及 Codex 订阅凭据，不去读取 Codex CLI 或其他账号文件，不发送凭据到第三方地址，也不跟随重定向。
 
 显示账号级额度，而非当前会话 token 统计：按服务端返回的窗口时长标注 5 小时、周或其他窗口，剩余比例为 `100 - used_percent`；显示重置时间（运行 Pi 的机器本地时区）、额外模型额度、代码审查额度和 Credits（仅在返回时）。缺失数据不会当成 100% 剩余。手动查询，无轮询、持久缓存或配置写入；结果通过 UI 通知显示，不发模型请求、不写入模型对话历史。HTTP 请求及读取最多等待 15 秒，响应读取最多 64 KiB；失败显示明确提示，不输出凭据或上游原始错误正文。
+
+已通过 Dock 内嵌 Pi `0.99.2-dock.1` 的真实 SDK 命令入口验证：当前 Codex 模型和切到其他 provider 时的官方模型选择、新版认证结果解析、JWT 中的账号归属、认证失败与自定义地址边界。测试使用合成认证和 HTTP 替身，不读取真实凭据、不请求模型；额度查询生产逻辑沿用新版仍支持的公开入口，未改变账号或计费语义。
 
 这是 ChatGPT 私有接口，不承诺长期稳定。服务不可用时可到 <https://chatgpt.com/codex/settings/usage> 查看。自动测试通过真实 Pi 扩展命令入口、合成凭据和 HTTP 测试替身验证。2026-09-28，用户在 Dock 中 `/reload` 后实际运行 `/codex-usage`，确认真实额度查询成功。
 
@@ -138,7 +140,11 @@ npm run smoke
 PI_CODING_AGENT_ROOT=/path/to/node_modules/@earendil-works/pi-coding-agent npm run smoke
 ```
 
-测试覆盖独立 `/codex-fast` 命令、模拟请求档位及状态栏切换、重载/新会话开关复位、统一 `/alu-agent` 命令入口与配置文件名、纪律注入与初始化快照、全局 guard 默认、A/B 会话隔离、命令保存及报错、无逐轮热加载、Sol/Astra 停止/压缩/续跑和重载安全。`test/smoke.mjs` 使用真实 Pi 扩展加载器及 Agent 回合钩子，事件上下文、压缩与续跑发送为测试替身。`test/lifecycle.mjs` 进一步使用真实 SDK 命令分发、`AgentSession.reload()` 和 `AgentSessionRuntime.newSession()`（Pi 0.84.2 内置命令使用的生命周期入口）验证重新初始化；UI 和模型查询为替身，不运行交互终端、不调用模型服务。所有配置均在临时目录，测试结束清理。请以普通用户运行，权限失败用例会实际将临时配置目录设为只读。
+本次适配在 Dock 内嵌 Pi `0.99.2-dock.1` 上验证。默认 `smoke` 保留额度查询、Codex Fast 和纪律的原有覆盖，并验证保护开关/阈值、Sol/Astra 停止/压缩/续跑、A/B 隔离、排队、执行失效状态及重载安全。
+
+`test/smoke.mjs` 使用真实扩展加载器与 Agent 配置钩子，事件上下文、部分压缩与续跑发送为测试替身。`test/lifecycle.mjs` 使用真实 SDK 命令分发、`AgentSession.reload()` 和 `AgentSessionRuntime.newSession()`；新增实际 AgentSession 回合链路验证工具执行、`finishTurn`/`turn_end`、默认压缩摘要生成、会话上下文重建、续跑及 steering/follow-up 排队。UI、认证与 provider 响应为替身，不读取真实凭据、不调用模型服务、不操作 Dock 运行实例。所有配置在临时目录，测试结束清理；请以普通用户运行，权限失败用例会实际将临时配置目录设为只读。
+
+需要单独定位保护时，可使用同一包目录运行 `npm run guard`；此入口仅跳过额度查询检查，不能替代默认 `smoke` 验收。安装/部署本次源码后需要 `/reload` 才会生效，本次验证未替主人执行。
 
 ## 移除
 

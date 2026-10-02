@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const guardOnly = process.argv.includes("--guard-only");
 const extensionPath = join(projectRoot, "index.ts");
 const piRoot = process.env.PI_CODING_AGENT_ROOT
 	?? join(execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim(), "@earendil-works", "pi-coding-agent");
@@ -33,9 +34,10 @@ try {
 				else calls.extensionStatus.set(key, text);
 			},
 		},
-		hasPendingMessages: () => false,
+		hasPendingMessages: () => !!calls.pending,
 		compact(options) {
 			calls.compactions++;
+			if (calls.deferCompact) { calls.compactOptions = options; return; }
 			if (calls.compactError) options.onError?.(new Error("synthetic compact failure"));
 			else options.onComplete?.({});
 		},
@@ -102,7 +104,29 @@ try {
 		newMessages: [assistant, ...toolResults],
 	});
 
+	const stopAfterTurn = async (config, completed) => (await config.finishTurn(completed))?.action === "end";
+
+	// Simulate upgrading the old process-global patch during /reload.
+	const original = Agent.prototype.createLoopConfig;
+	// A config exposing only the removed protocol cannot be advertised as enabled.
+	Agent.prototype.createLoopConfig = function (options) {
+		const { finishTurn: _removed, ...config } = original.call(this, options);
+		return config;
+	};
+	try {
+		const legacyRuntime = await loadRuntime("runtime-legacy-protocol");
+		await legacyRuntime.extension.commands.get("alu-agent").handler("on", legacyRuntime.ctx);
+		assert.match(legacyRuntime.calls.notifications.at(-1).text, /当前会话保护=不可用/);
+		assert.equal(legacyRuntime.calls.notifications.at(-1).level, "error");
+		await emit(legacyRuntime.extension, "session_shutdown", legacyRuntime.ctx, { reason: "shutdown" });
+	} finally { Agent.prototype.createLoopConfig = original; }
+	const oldHost = { original, controllers: new Map([["old-session", {}]]),
+		wrapper(options) { return { ...original.call(this, options), shouldStopAfterTurn: async () => false }; },
+	};
+	globalThis[Symbol.for("pi.sol-mid-turn-guard.patch.v2")] = oldHost;
+	Agent.prototype.createLoopConfig = oldHost.wrapper;
 	const runtimeA = await loadRuntime("runtime-a");
+	assert.equal(oldHost.controllers.size, 0);
 	assert.deepEqual([...runtimeA.extension.commands.keys()].sort(), ["alu-agent", "codex-fast", "codex-usage"]);
 	const fast = runtimeA.extension.commands.get("codex-fast").handler;
 	const payload = { model: "gpt-5.6-sol", instructions: "keep", text: { verbosity: "low" }, reasoning: { effort: "high" } };
@@ -139,7 +163,7 @@ try {
 	const wrapper = Agent.prototype.createLoopConfig;
 	const agentA = new Agent({ sessionId: "runtime-a" });
 	const configA = agentA.createLoopConfig();
-	if (typeof configA.shouldStopAfterTurn !== "function") throw new Error("runtime A hook was not installed");
+	if (typeof configA.finishTurn !== "function") throw new Error("runtime A hook was not installed");
 
 	// Runtime B is created later; it must not replace A's controller.
 	const runtimeB = await loadRuntime("runtime-b");
@@ -150,7 +174,7 @@ try {
 	assert.equal(await emit(runtimeB.extension, "before_provider_request", runtimeB.ctx, { payload }), undefined);
 	const agentB = new Agent({ sessionId: "runtime-b" });
 	const configB = agentB.createLoopConfig();
-	if (typeof configB.shouldStopAfterTurn !== "function") throw new Error("runtime B hook was not installed");
+	if (typeof configB.finishTurn !== "function") throw new Error("runtime B hook was not installed");
 	if (Agent.prototype.createLoopConfig !== wrapper) throw new Error("runtime B stacked the prototype wrapper");
 
 	const promptResult = await emit(runtimeB.extension, "before_agent_start", runtimeB.ctx, {
@@ -183,26 +207,44 @@ try {
 		throw new Error("Sol discipline marker did not prevent duplicate injection");
 	}
 
-	if (await configB.shouldStopAfterTurn(turn(message("other-model", 300_000)))) {
+	if (await stopAfterTurn(configB, turn(message("other-model", 300_000)))) {
 		throw new Error("unsupported model was stopped");
 	}
-	if (await configB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 250_000)))) {
+	if (await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_000)))) {
 		throw new Error("250k boundary should not stop");
 	}
-	if (await configB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 300_000, false), []))) {
+	if (await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 300_000, false), []))) {
 		throw new Error("no-tool turn was stopped");
 	}
 
 	agentB.steer({ role: "user", content: "owner queued", timestamp: Date.now() });
-	if (await configB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 250_001)))) {
+	if (await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_001)))) {
 		throw new Error("queued owner message should suppress stop");
 	}
 	agentB.clearAllQueues();
+	agentB.followUp({ role: "user", content: "owner follow-up", timestamp: Date.now() });
+	assert.equal(await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_001))), false);
+	agentB.clearAllQueues();
+	runtimeB.calls.pending = true;
+	assert.equal(await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_001))), false);
+	runtimeB.calls.pending = false;
+
+	// Preserve the existing hook's decision and AbortSignal; it is not native guard detection.
+	const upstreamAgent = new Agent({ sessionId: "runtime-a", finishTurn: async (_turn, signal) => {
+		assert.equal(signal, upstreamSignal);
+		return { action: "continue" };
+	} });
+	const upstreamSignal = new AbortController().signal;
+	assert.deepEqual(await upstreamAgent.createLoopConfig().finishTurn(turn(message("other-model", 300_000)), upstreamSignal), { action: "continue" });
+	upstreamAgent.finishTurn = async () => ({ action: "end" });
+	assert.deepEqual(await upstreamAgent.createLoopConfig().finishTurn(turn(message("gpt-5.6-sol", 250_001))), { action: "end" });
+	await emit(runtimeA.extension, "agent_settled", runtimeA.ctx);
+	assert.equal(runtimeA.calls.compactions, 0);
 
 	// Sol and Astra tool turns above the default threshold compact and resume the task.
 	for (const [index, model] of ["gpt-5.6-sol", "gpt-6-astra"].entries()) {
 		runtimeA.ctx.model = { provider: "openai-codex", id: model };
-		if (!(await configA.shouldStopAfterTurn(turn(message(model, 250_001))))) {
+		if (!(await stopAfterTurn(configA, turn(message(model, 250_001))))) {
 			throw new Error(`${model} did not stop above 250k after runtime B started`);
 		}
 		await emit(runtimeA.extension, "agent_settled", runtimeA.ctx);
@@ -222,7 +264,7 @@ try {
 		throw new Error("completed compaction left a persistent extension status");
 	}
 
-	if (!(await configB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 250_001))))) {
+	if (!(await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_001))))) {
 		throw new Error("runtime B did not stop independently");
 	}
 	// Turning off after a guard stop must still finish the pending continuation.
@@ -239,7 +281,7 @@ try {
 	// A failed plugin-owned compaction resumes normal work. Re-enabling allows
 	// the next successful tool turn to attempt compaction again.
 	await runtimeB.extension.commands.get("alu-agent").handler("on", runtimeB.ctx);
-	if (!(await configB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 250_001))))) {
+	if (!(await stopAfterTurn(configB, turn(message("gpt-5.6-sol", 250_001))))) {
 		throw new Error("runtime B did not retry compaction after resumed tool work");
 	}
 	runtimeB.calls.compactError = false;
@@ -268,7 +310,7 @@ try {
 	if (disabledPrompt !== undefined) throw new Error("disable=all did not suppress discipline injection");
 	const configuredAgent = new Agent({ sessionId: "runtime-configured" });
 	const configuredLoop = configuredAgent.createLoopConfig();
-	if (!(await configuredLoop.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 101))))) {
+	if (!(await stopAfterTurn(configuredLoop, turn(message("gpt-5.6-sol", 101))))) {
 		throw new Error("global guard threshold did not combine with project disable=all");
 	}
 	await emit(configuredRuntime.extension, "agent_settled", configuredRuntime.ctx);
@@ -292,7 +334,7 @@ try {
 	}
 	const overrideAgent = new Agent({ sessionId: "runtime-configured" });
 	const overrideLoop = overrideAgent.createLoopConfig();
-	if (!(await overrideLoop.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 150))))) {
+	if (!(await stopAfterTurn(overrideLoop, turn(message("gpt-5.6-sol", 150))))) {
 		throw new Error("project guard fields overrode global defaults");
 	}
 	// Pi's own automatic compaction has already completed: resume without a second compaction.
@@ -318,10 +360,45 @@ try {
 	await emit(runtimeB.extension, "session_shutdown", runtimeB.ctx, { reason: "reload" });
 	const replacementAgentB = new Agent({ sessionId: "runtime-b" });
 	const replacementConfigB = replacementAgentB.createLoopConfig();
-	if (!(await replacementConfigB.shouldStopAfterTurn(turn(message("gpt-5.6-sol", 250_001))))) {
+	if (!(await stopAfterTurn(replacementConfigB, turn(message("gpt-5.6-sol", 250_001))))) {
 		throw new Error("stale runtime B cleanup removed its replacement controller");
 	}
 	if (Agent.prototype.createLoopConfig !== wrapper) throw new Error("reload stacked or replaced the wrapper");
+
+	// A pending instruction at settle wins over compaction, and reload invalidates old callbacks.
+	const queuedRuntime = await loadRuntime("runtime-queued");
+	const queuedLoop = new Agent({ sessionId: "runtime-queued" }).createLoopConfig();
+	assert.equal(await stopAfterTurn(queuedLoop, turn(message("gpt-5.6-sol", 300_000))), true);
+	queuedRuntime.calls.pending = true;
+	await emit(queuedRuntime.extension, "agent_settled", queuedRuntime.ctx);
+	assert.equal(queuedRuntime.calls.compactions, 0);
+	queuedRuntime.calls.pending = false;
+	queuedRuntime.calls.deferCompact = true;
+	assert.equal(await stopAfterTurn(queuedLoop, turn(message("gpt-5.6-sol", 300_000))), true);
+	await emit(queuedRuntime.extension, "agent_settled", queuedRuntime.ctx);
+	const staleCompact = queuedRuntime.calls.compactOptions;
+	await emit(queuedRuntime.extension, "session_start", queuedRuntime.ctx);
+	assert.equal(await stopAfterTurn(queuedLoop, turn(message("gpt-5.6-sol", 300_000))), true);
+	await emit(queuedRuntime.extension, "agent_settled", queuedRuntime.ctx);
+	staleCompact.onComplete({});
+	assert.equal(queuedRuntime.calls.messages.length, 0);
+	queuedRuntime.calls.compactOptions.onComplete({});
+	assert.equal(queuedRuntime.calls.messages.length, 1);
+
+	// A broken guard or overwritten patch must report unavailable, including after /on.
+	queuedRuntime.ctx.hasPendingMessages = () => { throw new Error("synthetic guard failure"); };
+	assert.equal(await stopAfterTurn(queuedLoop, turn(message("gpt-5.6-sol", 300_000))), false);
+	await queuedRuntime.extension.commands.get("alu-agent").handler("on", queuedRuntime.ctx);
+	assert.match(queuedRuntime.calls.notifications.at(-1).text, /当前会话保护=不可用/);
+	assert.equal(queuedRuntime.calls.notifications.at(-1).level, "error");
+	Agent.prototype.createLoopConfig = original;
+	try {
+		const unavailable = await loadRuntime("runtime-unavailable");
+		await unavailable.extension.commands.get("alu-agent").handler("status", unavailable.ctx);
+		assert.match(unavailable.calls.notifications.at(-1).text, /当前会话保护=不可用/);
+		assert.equal(unavailable.calls.notifications.at(-1).level, "error");
+	} finally { Agent.prototype.createLoopConfig = wrapper; }
+	await emit(queuedRuntime.extension, "session_shutdown", queuedRuntime.ctx, { reason: "shutdown" });
 
 	await emit(runtimeA.extension, "session_shutdown", runtimeA.ctx, { reason: "shutdown" });
 	await emit(replacementB.extension, "session_shutdown", replacementB.ctx, { reason: "shutdown" });
@@ -329,7 +406,7 @@ try {
 	console.log(
 		"smoke ok: Codex Fast request tier/model switching/isolation/reset, discipline injection/gating/snapshot, global-only guard defaults, Sol/Astra stop/compact/resume, native compaction, compact error/retry, dual-runtime routing, stale cleanup, reload idempotence",
 	);
-	await runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, message });
+	await runLifecycle({ piRoot, tempAgentDir, extensionPath, turn, message, guardOnly });
 } finally {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
